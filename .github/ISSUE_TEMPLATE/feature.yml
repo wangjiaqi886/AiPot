@@ -1,0 +1,29 @@
+name: 馃専 Feature Request
+description: Suggest an idea
+title: '[Feature]: title'
+labels: ['type: enhancement']
+body:
+  - type: markdown
+    attributes:
+      value: |
+        # 猬嗭笍 Please give a concise and clear title 猬嗭笍
+        ## Thank you for your feedback. AiPot becomes better because of it.
+        ### Please confirm the following before submitting a new issue.
+        - I have carefully reviewed the repository README.
+        - I have searched through the historical issues but could not find an answer.
+  - type: textarea
+    attributes:
+      label: Description
+      description: Simply describe your idea.
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: Application Scenario
+      description: Why is there such a demand?
+    validations:
+      required: true
+  - type: textarea
+    attributes:
+      label: References
+      description: Provide implementation ideas or reference documents when necessary.

@@ -1,0 +1,303 @@
+import { contextBridge, ipcRenderer } from 'electron'
+import type {
+  AiPotElectronApi,
+  HttpRequest,
+  HttpResponse,
+  HttpStreamEvent,
+  PluginInfo,
+  PluginInstallResult,
+  PluginMarketplaceEntry,
+  TranslateRequest,
+  TranslateResult,
+  UpdateCheckResult,
+  UpdateEvent,
+  WindowLabel,
+} from '../shared/types/electron-api'
+import { runtimePlatform } from '../shared/platform'
+
+type IpcChannel =
+  | 'app:get-window-label'
+  | 'app:get-version'
+  | 'app:renderer-ready'
+  | 'app:close-current-window'
+  | 'app:hide-current-window'
+  | 'app:show-current-window'
+  | 'app:focus-current-window'
+  | 'app:set-current-window-always-on-top'
+  | 'app:set-current-window-resizable'
+  | 'app:set-current-window-bounds'
+  | 'app:get-current-window-bounds'
+  | 'app:get-current-display'
+  | 'app:is-current-window-maximized'
+  | 'app:set-auto-start'
+  | 'app:is-auto-start-enabled'
+  | 'app:minimize-current-window'
+  | 'app:maximize-current-window'
+  | 'app:unmaximize-current-window'
+  | 'app:emit'
+  | 'dialog:open'
+  | 'fs:read-dir'
+  | 'fs:read-text-file'
+  | 'fs:read-file'
+  | 'fs:exists'
+  | 'fs:remove'
+  | 'path:app-config-dir'
+  | 'path:app-cache-dir'
+  | 'hotkey:register'
+  | 'hotkey:unregister'
+  | 'hotkey:is-registered'
+  | 'command:invoke'
+  | 'http:request'
+  | 'config:get'
+  | 'config:get-all'
+  | 'config:set'
+  | 'workflow:selection-translate'
+  | 'workflow:input-translate'
+  | 'workflow:ocr-recognize'
+  | 'workflow:ocr-translate'
+  | 'update:check'
+  | 'update:download'
+  | 'update:install'
+  | 'update:open-release-page'
+  | 'services:translate'
+  | 'plugins:install'
+  | 'plugins:install-url'
+  | 'plugins:inspect-source'
+  | 'plugins:inspect-marketplace'
+  | 'plugins:list-installed'
+  | 'plugins:uninstall'
+  | 'plugins:set-enabled'
+  | 'plugins:open-folder'
+
+const channels = new Set<IpcChannel>([
+  'app:get-window-label',
+  'app:get-version',
+  'app:renderer-ready',
+  'app:close-current-window',
+  'app:hide-current-window',
+  'app:show-current-window',
+  'app:focus-current-window',
+  'app:set-current-window-always-on-top',
+  'app:set-current-window-resizable',
+  'app:set-current-window-bounds',
+  'app:get-current-window-bounds',
+  'app:get-current-display',
+  'app:is-current-window-maximized',
+  'app:set-auto-start',
+  'app:is-auto-start-enabled',
+  'app:minimize-current-window',
+  'app:maximize-current-window',
+  'app:unmaximize-current-window',
+  'app:emit',
+  'dialog:open',
+  'fs:read-dir',
+  'fs:read-text-file',
+  'fs:read-file',
+  'fs:exists',
+  'fs:remove',
+  'path:app-config-dir',
+  'path:app-cache-dir',
+  'hotkey:register',
+  'hotkey:unregister',
+  'hotkey:is-registered',
+  'command:invoke',
+  'http:request',
+  'config:get',
+  'config:get-all',
+  'config:set',
+  'workflow:selection-translate',
+  'workflow:input-translate',
+  'workflow:ocr-recognize',
+  'workflow:ocr-translate',
+  'update:check',
+  'update:download',
+  'update:install',
+  'update:open-release-page',
+  'services:translate',
+  'plugins:install',
+  'plugins:install-url',
+  'plugins:inspect-source',
+  'plugins:inspect-marketplace',
+  'plugins:list-installed',
+  'plugins:uninstall',
+  'plugins:set-enabled',
+  'plugins:open-folder',
+])
+
+async function invokeChecked<TResult>(channel: IpcChannel, payload?: unknown): Promise<TResult> {
+  if (!channels.has(channel)) {
+    throw new Error(`Unknown IPC channel: ${channel}`)
+  }
+
+  try {
+    return (await ipcRenderer.invoke(channel, payload)) as TResult
+  } catch (error) {
+    throw normalizeIpcInvokeError(error)
+  }
+}
+
+function normalizeIpcInvokeError(error: unknown): unknown {
+  if (!(error instanceof Error)) {
+    return error
+  }
+
+  const message = error.message.replace(/^Error invoking remote method '[^']+':\s*/i, '').trim()
+  const readableMessage =
+    message.length === 0 || message === '[object Object]' ? 'IPC request failed.' : message
+  const normalizedError = new Error(readableMessage)
+  normalizedError.name = error.name
+  normalizedError.stack = error.stack
+
+  return normalizedError
+}
+
+function isTrustedRendererLocation(): boolean {
+  const { protocol, hostname } = globalThis.location
+  if (protocol === 'aipot:') {
+    return true
+  }
+
+  return (
+    protocol === 'http:' &&
+    (hostname === 'localhost' ||
+      hostname === '127.0.0.1' ||
+      hostname === '[::1]' ||
+      hostname === '::1')
+  )
+}
+
+const api: AiPotElectronApi = {
+  app: {
+    platform: runtimePlatform(process.platform),
+    getWindowLabel: () => invokeChecked<WindowLabel>('app:get-window-label'),
+    getVersion: () => invokeChecked<string>('app:get-version'),
+    rendererReady: () => invokeChecked<void>('app:renderer-ready'),
+    closeCurrentWindow: () => invokeChecked<void>('app:close-current-window'),
+    hideCurrentWindow: () => invokeChecked<void>('app:hide-current-window'),
+    showCurrentWindow: () => invokeChecked<void>('app:show-current-window'),
+    focusCurrentWindow: () => invokeChecked<void>('app:focus-current-window'),
+    setCurrentWindowAlwaysOnTop: (alwaysOnTop) =>
+      invokeChecked<void>('app:set-current-window-always-on-top', { alwaysOnTop }),
+    setCurrentWindowResizable: (resizable) =>
+      invokeChecked<void>('app:set-current-window-resizable', { resizable }),
+    setCurrentWindowBounds: (bounds) =>
+      invokeChecked<void>('app:set-current-window-bounds', bounds),
+    getCurrentWindowBounds: () => invokeChecked('app:get-current-window-bounds'),
+    getCurrentDisplay: () => invokeChecked('app:get-current-display'),
+    isCurrentWindowMaximized: () => invokeChecked<boolean>('app:is-current-window-maximized'),
+    setAutoStart: (enabled) => invokeChecked<void>('app:set-auto-start', { enabled }),
+    isAutoStartEnabled: () => invokeChecked<boolean>('app:is-auto-start-enabled'),
+    minimizeCurrentWindow: () => invokeChecked<void>('app:minimize-current-window'),
+    maximizeCurrentWindow: () => invokeChecked<void>('app:maximize-current-window'),
+    unmaximizeCurrentWindow: () => invokeChecked<void>('app:unmaximize-current-window'),
+    emit: (event, payload) => invokeChecked<void>('app:emit', { event, payload }),
+    onEvent: (eventId, callback) => {
+      const listener = (_event: Electron.IpcRendererEvent, payload: unknown) => {
+        if (
+          typeof payload === 'object' &&
+          payload !== null &&
+          'event' in payload &&
+          payload.event === eventId
+        ) {
+          callback((payload as { payload?: unknown }).payload)
+        }
+      }
+
+      ipcRenderer.on('app:event', listener)
+      return () => ipcRenderer.removeListener('app:event', listener)
+    },
+  },
+  dialog: {
+    open: (options) => invokeChecked('dialog:open', options),
+  },
+  fs: {
+    readDir: (path, options) => invokeChecked('fs:read-dir', { path, ...options }),
+    readTextFile: (path, options) => invokeChecked('fs:read-text-file', { path, ...options }),
+    readFile: (path, options) => invokeChecked('fs:read-file', { path, ...options }),
+    exists: (path, options) => invokeChecked('fs:exists', { path, ...options }),
+    remove: (path, options) => invokeChecked('fs:remove', { path, ...options }),
+  },
+  path: {
+    appConfigDir: () => invokeChecked('path:app-config-dir'),
+    appCacheDir: () => invokeChecked('path:app-cache-dir'),
+  },
+  hotkey: {
+    register: (name, shortcut) => invokeChecked<boolean>('hotkey:register', { name, shortcut }),
+    unregister: (shortcut) => invokeChecked<void>('hotkey:unregister', { shortcut }),
+    isRegistered: (shortcut) => invokeChecked<boolean>('hotkey:is-registered', { shortcut }),
+  },
+  command: {
+    invoke: (command, payload) => invokeChecked('command:invoke', { command, payload }),
+  },
+  http: {
+    request: (request: HttpRequest) => invokeChecked<HttpResponse>('http:request', request),
+    stream: (request: HttpRequest, callback: (event: HttpStreamEvent) => void) => {
+      const { port1, port2 } = new MessageChannel()
+      let closed = false
+
+      port1.onmessage = (event: MessageEvent<HttpStreamEvent>) => {
+        callback(event.data)
+        if (event.data.type === 'end' || event.data.type === 'error') {
+          closed = true
+          port1.close()
+        }
+      }
+      port1.start()
+      ipcRenderer.postMessage('http:stream', request, [port2])
+
+      return () => {
+        if (closed) {
+          return
+        }
+        closed = true
+        port1.postMessage({ type: 'cancel' })
+        port1.close()
+      }
+    },
+  },
+  config: {
+    get: (key) => invokeChecked<unknown>('config:get', { key }),
+    getAll: () => invokeChecked<Record<string, unknown>>('config:get-all'),
+    set: (key, value) => invokeChecked<void>('config:set', { key, value }),
+  },
+  workflow: {
+    selectionTranslate: () => invokeChecked<void>('workflow:selection-translate'),
+    inputTranslate: () => invokeChecked<void>('workflow:input-translate'),
+    ocrRecognize: () => invokeChecked<void>('workflow:ocr-recognize'),
+    ocrTranslate: () => invokeChecked<void>('workflow:ocr-translate'),
+  },
+  updater: {
+    check: () => invokeChecked<UpdateCheckResult>('update:check'),
+    download: () => invokeChecked<void>('update:download'),
+    install: () => invokeChecked<void>('update:install'),
+    openReleasePage: () => invokeChecked<void>('update:open-release-page'),
+    onEvent: (callback) => {
+      const listener = (_event: Electron.IpcRendererEvent, payload: UpdateEvent) => {
+        callback(payload)
+      }
+
+      ipcRenderer.on('update:event', listener)
+      return () => ipcRenderer.removeListener('update:event', listener)
+    },
+  },
+  services: {
+    translate: (request: TranslateRequest) =>
+      invokeChecked<TranslateResult>('services:translate', request),
+  },
+  plugins: {
+    install: (file) => invokeChecked<PluginInstallResult>('plugins:install', { file }),
+    installFromUrl: (url) => invokeChecked<PluginInstallResult>('plugins:install-url', { url }),
+    inspectSource: (url) => invokeChecked<PluginInfo>('plugins:inspect-source', { url }),
+    inspectMarketplace: (url) =>
+      invokeChecked<PluginMarketplaceEntry[]>('plugins:inspect-marketplace', { url }),
+    listInstalled: (type) => invokeChecked<PluginInfo[]>('plugins:list-installed', { type }),
+    uninstall: (type, name) => invokeChecked<void>('plugins:uninstall', { type, name }),
+    setEnabled: (type, name, enabled) =>
+      invokeChecked<void>('plugins:set-enabled', { type, name, enabled }),
+    openFolder: () => invokeChecked<string>('plugins:open-folder'),
+  },
+}
+
+if (isTrustedRendererLocation()) {
+  contextBridge.exposeInMainWorld('aiPot', api)
+}

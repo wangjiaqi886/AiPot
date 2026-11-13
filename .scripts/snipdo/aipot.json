@@ -1,0 +1,12 @@
+{
+  "name": "AiPot Translation",
+  "identifier": "com.aipot.snipdoext.desktop",
+  "icon": "icon.png",
+  "actions": [
+    {
+      "title": "AiPot Translation",
+      "icon": "icon.png",
+      "powershellFile": "aipot.ps1"
+    }
+  ]
+}

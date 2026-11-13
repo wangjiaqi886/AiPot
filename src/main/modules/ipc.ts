@@ -1,0 +1,1126 @@
+import {
+  BrowserWindow,
+  app,
+  clipboard,
+  dialog,
+  ipcMain,
+  shell,
+  type IpcMainInvokeEvent,
+  type Rectangle,
+} from 'electron'
+import { execFile } from 'node:child_process'
+import { existsSync } from 'node:fs'
+import { mkdir, readdir, readFile, rm } from 'node:fs/promises'
+import path from 'node:path'
+import { promisify } from 'node:util'
+import { isLogLevel, toLogTransportLevel } from '../../shared/logLevel'
+import { getMainLogTransportLevel, logger, setMainLogTransportLevel } from '../logger'
+import { getAllConfig, getRedactedConfig, setConfig } from './config'
+import { setClipboardMonitorEnabled } from './clipboard'
+import { applyProxyToSession } from './proxy'
+import { updateTrayMenu } from './tray'
+import {
+  broadcastToAllWindows,
+  getCurrentWindowDisplayInfo,
+  markWindowReady,
+  type WindowLabel,
+} from './window'
+import {
+  getCurrentScreenshotAction,
+  getCurrentWorkflowText,
+  imageTranslate,
+  inputTranslate,
+  ocrRecognize,
+  ocrTranslate,
+  openUpdater,
+  recognizeWindow,
+  selectionTranslate,
+  textTranslate,
+} from './workflow'
+import { APP_USER_MODEL_ID } from './appIdentity'
+import { AUTO_START_HIDDEN_ARG } from './autoStart'
+
+export interface AiPotErrorPayload {
+  code: 'IPC_UNKNOWN_CHANNEL' | 'IPC_INVALID_PAYLOAD' | 'IPC_HANDLER_FAILED'
+  message: string
+  field?: string
+}
+
+export class AiPotError extends Error {
+  readonly code: AiPotErrorPayload['code']
+  readonly field?: string
+
+  constructor(payload: AiPotErrorPayload) {
+    super(payload.message)
+    this.name = 'AiPotError'
+    this.code = payload.code
+    this.field = payload.field
+  }
+}
+
+type IpcHandler = (event: IpcMainInvokeEvent, payload: unknown) => Promise<unknown> | unknown
+
+type AutoStartLoginItemCompareOptions = {
+  path?: string
+  args?: string[]
+}
+
+type AutoStartLoginItemSetOptions = AutoStartLoginItemCompareOptions & {
+  name?: string
+}
+
+interface RegisterIpcHandlersOptions {
+  getWindowLabel(event: IpcMainInvokeEvent): WindowLabel
+}
+
+const isRecord = (value: unknown): value is Record<string, unknown> =>
+  typeof value === 'object' && value !== null && !Array.isArray(value)
+
+export function getAutoStartLoginItemCompareOptions(): AutoStartLoginItemCompareOptions {
+  if (process.platform !== 'win32' || !app.isPackaged) {
+    return {}
+  }
+
+  return {
+    path: process.execPath,
+    args: [AUTO_START_HIDDEN_ARG],
+  }
+}
+
+function getLegacyAutoStartLoginItemCompareOptions(): AutoStartLoginItemCompareOptions {
+  if (process.platform !== 'win32' || !app.isPackaged) {
+    return {}
+  }
+
+  return {
+    path: process.execPath,
+    args: [],
+  }
+}
+
+function getAutoStartLoginItemSetOptions(): AutoStartLoginItemSetOptions {
+  if (process.platform !== 'win32' || !app.isPackaged) {
+    return {}
+  }
+
+  return {
+    ...getAutoStartLoginItemCompareOptions(),
+    name: APP_USER_MODEL_ID,
+  }
+}
+
+function getLegacyAutoStartLoginItemSetOptions(): AutoStartLoginItemSetOptions {
+  return {
+    ...getLegacyAutoStartLoginItemCompareOptions(),
+    ...(process.platform === 'win32' && app.isPackaged ? { name: APP_USER_MODEL_ID } : {}),
+  }
+}
+
+export function migrateAutoStartLoginItem(): void {
+  if (process.platform !== 'win32' || !app.isPackaged) {
+    return
+  }
+
+  const current = app.getLoginItemSettings(getAutoStartLoginItemCompareOptions())
+  const legacy = app.getLoginItemSettings(getLegacyAutoStartLoginItemCompareOptions())
+  if (current.openAtLogin || !legacy.openAtLogin) {
+    return
+  }
+
+  app.setLoginItemSettings({
+    openAtLogin: true,
+    ...getAutoStartLoginItemSetOptions(),
+  })
+}
+
+function setAutoStartEnabled(enabled: boolean): void {
+  if (process.platform !== 'win32' || !app.isPackaged) {
+    app.setLoginItemSettings({ openAtLogin: enabled })
+    return
+  }
+
+  if (!enabled) {
+    app.setLoginItemSettings({
+      openAtLogin: false,
+      ...getAutoStartLoginItemSetOptions(),
+    })
+    app.setLoginItemSettings({
+      openAtLogin: false,
+      ...getLegacyAutoStartLoginItemSetOptions(),
+    })
+    return
+  }
+
+  app.setLoginItemSettings({
+    openAtLogin: false,
+    ...getLegacyAutoStartLoginItemSetOptions(),
+  })
+  app.setLoginItemSettings({
+    openAtLogin: true,
+    ...getAutoStartLoginItemSetOptions(),
+  })
+}
+
+function isAutoStartEnabled(): boolean {
+  const current = app.getLoginItemSettings(getAutoStartLoginItemCompareOptions())
+  if (current.openAtLogin || process.platform !== 'win32' || !app.isPackaged) {
+    return current.openAtLogin
+  }
+
+  return app.getLoginItemSettings(getLegacyAutoStartLoginItemCompareOptions()).openAtLogin
+}
+
+const assertNoPayload = (payload: unknown) => {
+  if (payload !== undefined) {
+    throw new AiPotError({
+      code: 'IPC_INVALID_PAYLOAD',
+      message: 'Expected no payload.',
+    })
+  }
+}
+
+const assertKeyPayload = (payload: unknown): { key: string; value?: unknown } => {
+  if (!isRecord(payload) || typeof payload.key !== 'string' || payload.key.length === 0) {
+    throw new AiPotError({
+      code: 'IPC_INVALID_PAYLOAD',
+      message: 'Expected a non-empty config key.',
+      field: 'key',
+    })
+  }
+
+  return {
+    key: payload.key,
+    value: payload.value,
+  }
+}
+
+const assertPluginInstallPayload = (payload: unknown): { file: string } => {
+  if (!isRecord(payload) || typeof payload.file !== 'string' || payload.file.length === 0) {
+    throw new AiPotError({
+      code: 'IPC_INVALID_PAYLOAD',
+      message: 'Expected a plugin file path.',
+      field: 'file',
+    })
+  }
+
+  return { file: payload.file }
+}
+
+const assertPluginInstallUrlPayload = (payload: unknown): { url: string } => {
+  if (!isRecord(payload) || typeof payload.url !== 'string' || payload.url.length === 0) {
+    throw new AiPotError({
+      code: 'IPC_INVALID_PAYLOAD',
+      message: 'Expected a plugin URL or local source path.',
+      field: 'url',
+    })
+  }
+
+  return { url: payload.url }
+}
+
+const assertOptionalPluginListPayload = (payload: unknown): { type?: string } => {
+  if (payload === undefined) {
+    return {}
+  }
+
+  if (!isRecord(payload)) {
+    throw new AiPotError({
+      code: 'IPC_INVALID_PAYLOAD',
+      message: 'Expected plugin list payload.',
+    })
+  }
+
+  return {
+    type: typeof payload.type === 'string' ? payload.type : undefined,
+  }
+}
+
+const assertPluginIdentityPayload = (payload: unknown): { type: string; name: string } => {
+  if (
+    !isRecord(payload) ||
+    typeof payload.type !== 'string' ||
+    payload.type.length === 0 ||
+    typeof payload.name !== 'string' ||
+    payload.name.length === 0
+  ) {
+    throw new AiPotError({
+      code: 'IPC_INVALID_PAYLOAD',
+      message: 'Expected plugin type and name.',
+    })
+  }
+
+  return { type: payload.type, name: payload.name }
+}
+
+const assertPluginEnabledPayload = (
+  payload: unknown,
+): { type: string; name: string; enabled: boolean } => {
+  const { type, name } = assertPluginIdentityPayload(payload)
+  if (!isRecord(payload) || typeof payload.enabled !== 'boolean') {
+    throw new AiPotError({
+      code: 'IPC_INVALID_PAYLOAD',
+      message: 'Expected plugin enabled state.',
+      field: 'enabled',
+    })
+  }
+
+  return { type, name, enabled: payload.enabled }
+}
+
+const assertBooleanPayload = (payload: unknown, field: string): boolean => {
+  if (!isRecord(payload) || typeof payload[field] !== 'boolean') {
+    throw new AiPotError({
+      code: 'IPC_INVALID_PAYLOAD',
+      message: `Expected boolean field: ${field}.`,
+      field,
+    })
+  }
+
+  return payload[field]
+}
+
+const assertWindowBoundsPayload = (payload: unknown) => {
+  if (!isRecord(payload)) {
+    throw new AiPotError({
+      code: 'IPC_INVALID_PAYLOAD',
+      message: 'Expected window bounds object.',
+    })
+  }
+
+  const bounds: Rectangle = {
+    x: Number(payload.x ?? 0),
+    y: Number(payload.y ?? 0),
+    width: Number(payload.width ?? 0),
+    height: Number(payload.height ?? 0),
+  }
+
+  return {
+    x: typeof payload.x === 'number' ? bounds.x : undefined,
+    y: typeof payload.y === 'number' ? bounds.y : undefined,
+    width: typeof payload.width === 'number' ? bounds.width : undefined,
+    height: typeof payload.height === 'number' ? bounds.height : undefined,
+  }
+}
+
+const assertEventPayload = (payload: unknown): { event: string; payload?: unknown } => {
+  if (!isRecord(payload) || typeof payload.event !== 'string' || payload.event.length === 0) {
+    throw new AiPotError({
+      code: 'IPC_INVALID_PAYLOAD',
+      message: 'Expected a non-empty event name.',
+      field: 'event',
+    })
+  }
+
+  return {
+    event: payload.event,
+    payload: payload.payload,
+  }
+}
+
+const assertShortcutPayload = (payload: unknown): { name?: string; shortcut: string } => {
+  if (!isRecord(payload) || typeof payload.shortcut !== 'string') {
+    throw new AiPotError({
+      code: 'IPC_INVALID_PAYLOAD',
+      message: 'Expected shortcut string.',
+      field: 'shortcut',
+    })
+  }
+
+  return {
+    name: typeof payload.name === 'string' ? payload.name : undefined,
+    shortcut: payload.shortcut,
+  }
+}
+
+const assertCommandPayload = (
+  payload: unknown,
+): { command: string; payload?: Record<string, unknown> } => {
+  if (!isRecord(payload) || typeof payload.command !== 'string' || payload.command.length === 0) {
+    throw new AiPotError({
+      code: 'IPC_INVALID_PAYLOAD',
+      message: 'Expected command string.',
+      field: 'command',
+    })
+  }
+
+  return {
+    command: payload.command,
+    payload: isRecord(payload.payload) ? payload.payload : undefined,
+  }
+}
+
+const assertDialogOpenPayload = (payload: unknown) => {
+  if (!isRecord(payload)) {
+    return {}
+  }
+
+  const allowedProperties = new Set(['openFile', 'openDirectory', 'multiSelections'])
+  const properties = Array.isArray(payload.properties)
+    ? payload.properties.filter(
+        (property): property is 'openFile' | 'openDirectory' | 'multiSelections' =>
+          typeof property === 'string' && allowedProperties.has(property),
+      )
+    : undefined
+
+  const filters = Array.isArray(payload.filters)
+    ? payload.filters
+        .filter(
+          (filter) =>
+            isRecord(filter) && typeof filter.name === 'string' && Array.isArray(filter.extensions),
+        )
+        .map((filter) => ({
+          name: filter.name as string,
+          extensions: (filter.extensions as unknown[]).filter(
+            (extension): extension is string => typeof extension === 'string',
+          ),
+        }))
+    : undefined
+
+  return {
+    multiple: payload.multiple === true,
+    directory: payload.directory === true,
+    properties,
+    filters,
+  }
+}
+
+type SupportedBaseDirectory = 'AppConfig' | 'AppCache' | 'AppLog'
+
+const supportedBaseDirectories = new Set<SupportedBaseDirectory>([
+  'AppConfig',
+  'AppCache',
+  'AppLog',
+])
+
+const resolveBaseDirectory = (baseDir: unknown): string | null => {
+  switch (baseDir) {
+    case 'AppConfig':
+      return app.getPath('userData')
+    case 'AppCache':
+      return path.join(app.getPath('userData'), 'Cache')
+    case 'AppLog':
+      return app.getPath('logs')
+    default:
+      return null
+  }
+}
+
+const assertPathPayload = (
+  payload: unknown,
+): { filePath: string; baseDir?: SupportedBaseDirectory } => {
+  if (!isRecord(payload) || typeof payload.path !== 'string') {
+    throw new AiPotError({
+      code: 'IPC_INVALID_PAYLOAD',
+      message: 'Expected file path.',
+      field: 'path',
+    })
+  }
+
+  return {
+    filePath: payload.path,
+    baseDir:
+      typeof payload.baseDir === 'string' &&
+      supportedBaseDirectories.has(payload.baseDir as SupportedBaseDirectory)
+        ? (payload.baseDir as SupportedBaseDirectory)
+        : undefined,
+  }
+}
+
+function assertPathInside(parent: string, child: string): void {
+  const parentPath = path.resolve(parent)
+  const childPath = path.resolve(child)
+  const comparisonParent = process.platform === 'win32' ? parentPath.toLowerCase() : parentPath
+  const comparisonChild = process.platform === 'win32' ? childPath.toLowerCase() : childPath
+  if (
+    comparisonChild !== comparisonParent &&
+    !comparisonChild.startsWith(comparisonParent + path.sep)
+  ) {
+    throw new AiPotError({
+      code: 'IPC_INVALID_PAYLOAD',
+      message: 'Resolved path is outside the allowed base directory.',
+      field: 'path',
+    })
+  }
+}
+
+function allowedFileRoots(): string[] {
+  return [app.getPath('userData'), path.join(app.getPath('userData'), 'Cache'), app.getPath('logs')]
+}
+
+const resolveFilePath = (payload: unknown): string => {
+  const { filePath, baseDir } = assertPathPayload(payload)
+  const basePath = resolveBaseDirectory(baseDir)
+  if (basePath) {
+    const resolvedPath = path.resolve(basePath, filePath)
+    assertPathInside(basePath, resolvedPath)
+    return resolvedPath
+  }
+
+  if (!path.isAbsolute(filePath)) {
+    throw new AiPotError({
+      code: 'IPC_INVALID_PAYLOAD',
+      message: 'Relative filesystem paths require a supported baseDir.',
+      field: 'baseDir',
+    })
+  }
+
+  const resolvedPath = path.resolve(filePath)
+  if (
+    !allowedFileRoots().some((root) => {
+      try {
+        assertPathInside(root, resolvedPath)
+        return true
+      } catch {
+        return false
+      }
+    })
+  ) {
+    throw new AiPotError({
+      code: 'IPC_INVALID_PAYLOAD',
+      message: 'Absolute filesystem paths are limited to AiPot app data paths.',
+      field: 'path',
+    })
+  }
+
+  return resolvedPath
+}
+
+const resolveRemovableFilePath = (payload: unknown): string => {
+  const { baseDir } = assertPathPayload(payload)
+  if (baseDir !== 'AppCache') {
+    throw new AiPotError({
+      code: 'IPC_INVALID_PAYLOAD',
+      message: 'Renderer delete operations are limited to AppCache.',
+      field: 'baseDir',
+    })
+  }
+
+  return resolveFilePath(payload)
+}
+
+const assertTextPayload = (payload: unknown): string => {
+  if (!isRecord(payload) || typeof payload.text !== 'string') {
+    throw new AiPotError({
+      code: 'IPC_INVALID_PAYLOAD',
+      message: 'Expected text string.',
+      field: 'text',
+    })
+  }
+
+  return payload.text
+}
+
+const assertUrlPayload = (payload: unknown): string => {
+  if (!isRecord(payload) || typeof payload.url !== 'string' || payload.url.length === 0) {
+    throw new AiPotError({
+      code: 'IPC_INVALID_PAYLOAD',
+      message: 'Expected URL string.',
+      field: 'url',
+    })
+  }
+
+  return payload.url
+}
+
+const normalizeError = (error: unknown): AiPotErrorPayload => {
+  if (error instanceof AiPotError) {
+    return {
+      code: error.code,
+      message: error.message,
+      field: error.field,
+    }
+  }
+
+  const message = error instanceof Error ? error.message : String(error)
+  return {
+    code: 'IPC_HANDLER_FAILED',
+    message,
+  }
+}
+
+const summarizePayloadForLog = (payload: unknown): Record<string, unknown> => {
+  if (!isRecord(payload)) {
+    return {
+      payloadType: typeof payload,
+    }
+  }
+
+  const summary: Record<string, unknown> = {}
+  for (const [key, value] of Object.entries(payload)) {
+    const summaryKey = `payload_${key}`
+    if (typeof value === 'string') {
+      summary[summaryKey] = `[string length=${value.length}]`
+    } else if (Array.isArray(value)) {
+      summary[summaryKey] = `[array length=${value.length}]`
+    } else if (isRecord(value)) {
+      summary[summaryKey] = `[object keys=${Object.keys(value).length}]`
+    } else {
+      summary[summaryKey] = value
+    }
+  }
+
+  return summary
+}
+
+const execFileAsync = promisify(execFile)
+
+function broadcastAppEvent(event: string, payload?: unknown): void {
+  broadcastToAllWindows('app:event', { event, payload })
+}
+
+async function listSystemFonts(): Promise<string[]> {
+  if (process.platform !== 'win32') {
+    return []
+  }
+
+  const { stdout } = await execFileAsync(
+    'powershell.exe',
+    [
+      '-NoProfile',
+      '-Command',
+      'Add-Type -AssemblyName System.Drawing; (New-Object System.Drawing.Text.InstalledFontCollection).Families | ForEach-Object { $_.Name }',
+    ],
+    {
+      windowsHide: true,
+      timeout: 5000,
+    },
+  )
+
+  return [
+    ...new Set(
+      stdout
+        .split(/\r?\n/)
+        .map((font) => font.trim())
+        .filter(Boolean),
+    ),
+  ].sort((a, b) => a.localeCompare(b))
+}
+
+export function registerIpcHandlers(options: RegisterIpcHandlersOptions): void {
+  const handlers: Record<string, IpcHandler> = {
+    'app:get-window-label': (event, payload) => {
+      assertNoPayload(payload)
+      return options.getWindowLabel(event)
+    },
+    'app:get-version': (_event, payload) => {
+      assertNoPayload(payload)
+      return app.getVersion()
+    },
+    'app:renderer-ready': (event, payload) => {
+      assertNoPayload(payload)
+      markWindowReady(options.getWindowLabel(event))
+    },
+    'app:close-current-window': (event, payload) => {
+      assertNoPayload(payload)
+      BrowserWindow.fromWebContents(event.sender)?.close()
+    },
+    'app:hide-current-window': (event, payload) => {
+      assertNoPayload(payload)
+      BrowserWindow.fromWebContents(event.sender)?.hide()
+    },
+    'app:show-current-window': (event, payload) => {
+      assertNoPayload(payload)
+      BrowserWindow.fromWebContents(event.sender)?.show()
+    },
+    'app:focus-current-window': (event, payload) => {
+      assertNoPayload(payload)
+      BrowserWindow.fromWebContents(event.sender)?.focus()
+    },
+    'app:set-current-window-always-on-top': (event, payload) => {
+      const window = BrowserWindow.fromWebContents(event.sender)
+      const alwaysOnTop = assertBooleanPayload(payload, 'alwaysOnTop')
+      if (alwaysOnTop) {
+        window?.setAlwaysOnTop(true, 'screen-saver')
+      } else {
+        window?.setAlwaysOnTop(false)
+      }
+    },
+    'app:set-current-window-resizable': (event, payload) => {
+      BrowserWindow.fromWebContents(event.sender)?.setResizable(
+        assertBooleanPayload(payload, 'resizable'),
+      )
+    },
+    'app:set-current-window-bounds': (event, payload) => {
+      BrowserWindow.fromWebContents(event.sender)?.setBounds(assertWindowBoundsPayload(payload))
+    },
+    'app:get-current-window-bounds': (event, payload) => {
+      assertNoPayload(payload)
+      return (
+        BrowserWindow.fromWebContents(event.sender)?.getBounds() ?? {
+          x: 0,
+          y: 0,
+          width: 0,
+          height: 0,
+        }
+      )
+    },
+    'app:get-current-display': (event, payload) => {
+      assertNoPayload(payload)
+      return getCurrentWindowDisplayInfo(event.sender)
+    },
+    'app:is-current-window-maximized': (event, payload) => {
+      assertNoPayload(payload)
+      return BrowserWindow.fromWebContents(event.sender)?.isMaximized() ?? false
+    },
+    'app:set-auto-start': (_event, payload) => {
+      setAutoStartEnabled(assertBooleanPayload(payload, 'enabled'))
+    },
+    'app:is-auto-start-enabled': (_event, payload) => {
+      assertNoPayload(payload)
+      return isAutoStartEnabled()
+    },
+    'app:minimize-current-window': (event, payload) => {
+      assertNoPayload(payload)
+      event.sender.send('app:event', { event: 'aipot://minimize' })
+      BrowserWindow.fromWebContents(event.sender)?.minimize()
+    },
+    'app:maximize-current-window': (event, payload) => {
+      assertNoPayload(payload)
+      BrowserWindow.fromWebContents(event.sender)?.maximize()
+    },
+    'app:unmaximize-current-window': (event, payload) => {
+      assertNoPayload(payload)
+      BrowserWindow.fromWebContents(event.sender)?.unmaximize()
+    },
+    'app:emit': (_event, payload) => {
+      const emitted = assertEventPayload(payload)
+      broadcastAppEvent(emitted.event, emitted.payload)
+    },
+    'dialog:open': async (_event, payload) => {
+      const options = assertDialogOpenPayload(payload)
+      const properties: Array<'openFile' | 'openDirectory' | 'multiSelections'> =
+        options.properties && options.properties.length > 0
+          ? options.properties
+          : [options.directory ? 'openDirectory' : 'openFile']
+      if (options.multiple && !properties.includes('multiSelections')) {
+        properties.push('multiSelections')
+      }
+
+      const result = await dialog.showOpenDialog({
+        properties,
+        filters: options.filters,
+      })
+
+      if (result.canceled) {
+        return null
+      }
+
+      return options.multiple ? result.filePaths : result.filePaths[0]
+    },
+    'fs:read-dir': async (_event, payload) => {
+      const entries = await readdir(resolveFilePath(payload), { withFileTypes: true }).catch(
+        () => [],
+      )
+      return entries.map((entry) => ({
+        name: entry.name,
+        isDirectory: entry.isDirectory(),
+        isFile: entry.isFile(),
+      }))
+    },
+    'fs:read-text-file': (_event, payload) => {
+      return readFile(resolveFilePath(payload), 'utf8')
+    },
+    'fs:read-file': async (_event, payload) => {
+      return [...(await readFile(resolveFilePath(payload)))]
+    },
+    'fs:exists': (_event, payload) => {
+      return existsSync(resolveFilePath(payload))
+    },
+    'fs:remove': async (_event, payload) => {
+      const targetPath = resolveRemovableFilePath(payload)
+      if (isRecord(payload) && payload.recursive === true) {
+        await rm(targetPath, { recursive: true, force: true })
+        return
+      }
+
+      await rm(targetPath, { force: true })
+    },
+    'path:app-config-dir': (_event, payload) => {
+      assertNoPayload(payload)
+      return app.getPath('userData')
+    },
+    'path:app-cache-dir': async (_event, payload) => {
+      assertNoPayload(payload)
+      const cachePath = path.join(app.getPath('userData'), 'Cache')
+      await mkdir(cachePath, { recursive: true })
+      return cachePath
+    },
+    'hotkey:register': (_event, payload) => {
+      const { name, shortcut } = assertShortcutPayload(payload)
+      return name
+        ? import('./hotkey').then(({ registerGlobalShortcutByName }) =>
+            registerGlobalShortcutByName(name, shortcut),
+          )
+        : false
+    },
+    'hotkey:unregister': (_event, payload) => {
+      const { shortcut } = assertShortcutPayload(payload)
+      return import('./hotkey').then(({ unregisterGlobalShortcut }) =>
+        unregisterGlobalShortcut(shortcut),
+      )
+    },
+    'hotkey:is-registered': (_event, payload) => {
+      const { shortcut } = assertShortcutPayload(payload)
+      return import('./hotkey').then(({ isGlobalShortcutRegistered }) =>
+        isGlobalShortcutRegistered(shortcut),
+      )
+    },
+    'command:invoke': async (_event, payload) => {
+      const { command, payload: args } = assertCommandPayload(payload)
+
+      switch (command) {
+        case 'register_shortcut_by_frontend': {
+          if (!args || typeof args.name !== 'string' || typeof args.shortcut !== 'string') {
+            throw new AiPotError({
+              code: 'IPC_INVALID_PAYLOAD',
+              message: 'Expected name and shortcut.',
+            })
+          }
+          const { name, shortcut } = args
+          return import('./hotkey').then(({ registerGlobalShortcutByName }) =>
+            registerGlobalShortcutByName(name, shortcut),
+          )
+        }
+        case 'screenshot': {
+          const { captureDisplayForPoint, consumePreparedCapture, getCaptureUrl } =
+            await import('./screenshot')
+          const preparedCapture = consumePreparedCapture()
+          if (preparedCapture) {
+            return preparedCapture
+          }
+          await captureDisplayForPoint({
+            x: Number(args?.x ?? 0),
+            y: Number(args?.y ?? 0),
+          })
+          return getCaptureUrl()
+        }
+        case 'cut_image': {
+          const { cropCapture } = await import('./screenshot')
+          cropCapture({
+            x: Number(args?.left ?? 0),
+            y: Number(args?.top ?? 0),
+            width: Number(args?.width ?? 0),
+            height: Number(args?.height ?? 0),
+          })
+          return ''
+        }
+        case 'screenshot_complete':
+          if (getCurrentScreenshotAction() === 'translate') {
+            await imageTranslate()
+          } else {
+            await recognizeWindow()
+          }
+          return undefined
+        case 'get_base64': {
+          const { getLastCroppedBase64 } = await import('./screenshot')
+          return getLastCroppedBase64()
+        }
+        case 'copy_img': {
+          const { getClipboardImage } = await import('./screenshot')
+          const image = getClipboardImage()
+          if (!image.isEmpty()) {
+            clipboard.writeImage(image)
+          }
+          return undefined
+        }
+        case 'write_clipboard_text': {
+          // Main-process clipboard write: the renderer's
+          // navigator.clipboard.writeText requires document focus, which is
+          // gone when auto-copy fires on a hidden/unfocused translate window
+          // (NotAllowedError). Electron's clipboard API has no such rule.
+          clipboard.writeText(assertTextPayload(args))
+          return true
+        }
+        case 'get_text':
+          return getCurrentWorkflowText()
+        case 'translate_text':
+          return textTranslate(assertTextPayload(args))
+        case 'lang_detect': {
+          const { detectLanguage } = await import('./lang-detect')
+          return detectLanguage(assertTextPayload(args))
+        }
+        case 'font_list':
+          return listSystemFonts()
+        case 'update_tray':
+          updateTrayMenu()
+          return undefined
+        case 'updater_window':
+          await openUpdater()
+          return undefined
+        case 'open_url': {
+          const { safeOpenExternal } = await import('./shellSafety')
+          await safeOpenExternal(assertUrlPayload(args))
+          return undefined
+        }
+        case 'open_log_dir':
+          await shell.openPath(app.getPath('logs'))
+          return undefined
+        case 'open_config_dir':
+          await shell.openPath(app.getPath('userData'))
+          return undefined
+        case 'set_proxy':
+          await applyProxyToSession(true)
+          return true
+        case 'unset_proxy':
+          await applyProxyToSession(false)
+          return true
+        case 'set_clipboard_monitor':
+          setClipboardMonitorEnabled(assertBooleanPayload(args, 'enabled'))
+          return true
+        case 'run_binary': {
+          if (
+            !args ||
+            typeof args.pluginType !== 'string' ||
+            typeof args.pluginName !== 'string' ||
+            typeof args.cmdName !== 'string'
+          ) {
+            throw new AiPotError({
+              code: 'IPC_INVALID_PAYLOAD',
+              message: 'Expected plugin type, plugin name, and command name.',
+            })
+          }
+          const { runPluginBinary } = await import('../plugins/binary')
+          return runPluginBinary({
+            pluginType: args.pluginType,
+            pluginName: args.pluginName,
+            cmdName: args.cmdName,
+            args: args.args,
+          })
+        }
+        case 'open_devtools':
+          BrowserWindow.getFocusedWindow()?.webContents.openDevTools({ mode: 'detach' })
+          return undefined
+        case 'log:set-level': {
+          const level =
+            args && typeof args === 'object' && 'level' in args ? String(args.level) : ''
+          if (!isLogLevel(level)) {
+            throw new AiPotError({
+              code: 'IPC_INVALID_PAYLOAD',
+              message: `Invalid log level: ${level}`,
+            })
+          }
+          const transportLevel = toLogTransportLevel(level)
+          setMainLogTransportLevel(transportLevel)
+          logger.info('Log level changed.', {
+            level,
+          })
+          return true
+        }
+        case 'log:get-level':
+          return getMainLogTransportLevel()
+        default:
+          throw new AiPotError({
+            code: 'IPC_UNKNOWN_CHANNEL',
+            message: `Unsupported command: ${command}`,
+          })
+      }
+    },
+    'config:get': (_event, payload) => {
+      const { key } = assertKeyPayload(payload)
+      return getRedactedConfig(key)
+    },
+    'config:get-all': (_event, payload) => {
+      assertNoPayload(payload)
+      return getAllConfig()
+    },
+    'http:request': async (_event, payload) => {
+      const { rendererHttpRequest } = await import('./http')
+      return rendererHttpRequest(payload)
+    },
+    'config:set': async (_event, payload) => {
+      const { key, value } = assertKeyPayload(payload)
+      await setConfig(key, value)
+      if (key === 'clipboard_monitor') {
+        setClipboardMonitorEnabled(Boolean(value))
+      }
+      if (
+        [
+          'proxy_enable',
+          'proxy_host',
+          'proxy_port',
+          'proxy_username',
+          'proxy_password',
+          'no_proxy',
+        ].includes(key)
+      ) {
+        await applyProxyToSession()
+      }
+      broadcastAppEvent('config:changed', { key })
+      logger.info('Config value change broadcasted.', {
+        key,
+      })
+    },
+    'workflow:selection-translate': (_event, payload) => {
+      assertNoPayload(payload)
+      return selectionTranslate()
+    },
+    'workflow:input-translate': (_event, payload) => {
+      assertNoPayload(payload)
+      return inputTranslate()
+    },
+    'workflow:ocr-recognize': (_event, payload) => {
+      assertNoPayload(payload)
+      return ocrRecognize()
+    },
+    'workflow:ocr-translate': (_event, payload) => {
+      assertNoPayload(payload)
+      return ocrTranslate()
+    },
+    'update:check': async (_event, payload) => {
+      assertNoPayload(payload)
+      const { check } = await import('./updater')
+      return check()
+    },
+    'update:download': async (_event, payload) => {
+      assertNoPayload(payload)
+      const { download } = await import('./updater')
+      return download()
+    },
+    'update:install': async (_event, payload) => {
+      assertNoPayload(payload)
+      const { install } = await import('./updater')
+      install()
+    },
+    'update:open-release-page': async (_event, payload) => {
+      assertNoPayload(payload)
+      const { openReleasePage } = await import('./updater')
+      return openReleasePage()
+    },
+    'services:translate': async (_event, payload) => {
+      if (!isRecord(payload)) {
+        throw new AiPotError({
+          code: 'IPC_INVALID_PAYLOAD',
+          message: 'Expected a translation request object.',
+        })
+      }
+
+      const { translate } = await import('../services')
+      return translate(payload)
+    },
+    'plugins:install': async (_event, payload) => {
+      const { file } = assertPluginInstallPayload(payload)
+      const { installPlugin } = await import('../plugins/installer')
+      return installPlugin(file)
+    },
+    'plugins:install-url': async (_event, payload) => {
+      const { url } = assertPluginInstallUrlPayload(payload)
+      const { installPluginFromUrl } = await import('../plugins/installer')
+      return installPluginFromUrl(url)
+    },
+    'plugins:inspect-source': async (_event, payload) => {
+      const { url } = assertPluginInstallUrlPayload(payload)
+      const { readPluginManifestFromSource } = await import('../plugins/installer')
+      return readPluginManifestFromSource(url)
+    },
+    'plugins:inspect-marketplace': async (_event, payload) => {
+      const { url } = assertPluginInstallUrlPayload(payload)
+      const { readPluginMarketplaceFromSource } = await import('../plugins/marketplace')
+      return readPluginMarketplaceFromSource(url)
+    },
+    'plugins:list-installed': async (_event, payload) => {
+      const { type } = assertOptionalPluginListPayload(payload)
+      const { listInstalledPlugins } = await import('../plugins/installer')
+      return listInstalledPlugins(type)
+    },
+    'plugins:uninstall': async (_event, payload) => {
+      const { type, name } = assertPluginIdentityPayload(payload)
+      const { uninstallPlugin } = await import('../plugins/installer')
+      return uninstallPlugin(type, name)
+    },
+    'plugins:set-enabled': async (_event, payload) => {
+      const { type, name, enabled } = assertPluginEnabledPayload(payload)
+      const { setPluginEnabled } = await import('../plugins/installer')
+      return setPluginEnabled(type, name, enabled)
+    },
+    'plugins:open-folder': async (_event, payload) => {
+      assertNoPayload(payload)
+      const { pluginRoot } = await import('../plugins/installer')
+      await mkdir(pluginRoot(), { recursive: true })
+      return shell.openPath(pluginRoot())
+    },
+  }
+
+  for (const [channel, handler] of Object.entries(handlers)) {
+    ipcMain.handle(channel, async (event, payload) => {
+      try {
+        return await handler(event, payload)
+      } catch (error) {
+        const normalizedError = normalizeError(error)
+        const command =
+          isRecord(payload) && typeof payload.command === 'string' ? payload.command : undefined
+        logger.error('IPC handler failed.', {
+          channel,
+          command,
+          code: normalizedError.code,
+          message: normalizedError.message,
+          ...summarizePayloadForLog(payload),
+        })
+        throw new AiPotError(normalizedError)
+      }
+    })
+  }
+
+  ipcMain.on('http:stream', (event, payload) => {
+    const port = event.ports[0]
+    if (!port) {
+      logger.error('HTTP stream request did not include a reply port.')
+      return
+    }
+
+    const controller = new AbortController()
+    let closed = false
+    const close = () => {
+      if (!closed) {
+        closed = true
+        port.close()
+      }
+    }
+    const post = (message: unknown) => {
+      if (!closed) {
+        port.postMessage(message)
+      }
+    }
+
+    port.on('message', (message) => {
+      if (isRecord(message.data) && message.data.type === 'cancel') {
+        controller.abort()
+        close()
+      }
+    })
+    port.on('close', () => {
+      controller.abort()
+    })
+    port.start()
+
+    void import('./http')
+      .then(({ streamRendererHttpRequest }) =>
+        streamRendererHttpRequest(
+          payload,
+          {
+            onResponse: (response) => {
+              post({ type: 'response', ...response })
+            },
+            onChunk: (data) => {
+              post({ type: 'chunk', data })
+            },
+          },
+          controller.signal,
+        ),
+      )
+      .then(() => {
+        post({ type: 'end' })
+      })
+      .catch((error: unknown) => {
+        if (!controller.signal.aborted) {
+          const normalizedError = normalizeError(error)
+          logger.error('HTTP stream request failed.', {
+            code: normalizedError.code,
+            message: normalizedError.message,
+            ...summarizePayloadForLog(payload),
+          })
+          post({ type: 'error', message: normalizedError.message })
+        }
+      })
+      .finally(close)
+  })
+}

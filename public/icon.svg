@@ -1,0 +1,29 @@
+﻿<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1024 1024" role="img" aria-label="AiPot icon">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#242B80"/>
+      <stop offset="1" stop-color="#7C3AED"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="30%" cy="24%" r="72%">
+      <stop offset="0" stop-color="#6366F1" stop-opacity="0.35"/>
+      <stop offset="1" stop-color="#6366F1" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="1024" height="1024" rx="220" fill="url(#bg)"/>
+  <rect width="1024" height="1024" rx="220" fill="url(#glow)"/>
+  <g fill="#E0FFFF">
+    <path d="M512 178 L548 270 L640 306 L548 342 L512 434 L476 342 L384 306 L476 270 Z"/>
+  </g>
+  <rect x="295" y="422" width="434" height="362" rx="62" fill="#FFFFFF"/>
+  <rect x="306" y="688" width="412" height="86" rx="43" fill="#E2E8F0"/>
+  <rect x="245" y="375" width="534" height="65" rx="32" fill="#F1F5F9"/>
+  <rect x="252" y="380" width="520" height="52" rx="26" fill="#FFFFFF"/>
+  <rect x="195" y="478" width="104" height="122" rx="38" fill="#FFFFFF"/>
+  <rect x="725" y="478" width="104" height="122" rx="38" fill="#FFFFFF"/>
+  <rect x="209" y="500" width="76" height="78" rx="25" fill="#E2E8F0"/>
+  <rect x="739" y="500" width="76" height="78" rx="25" fill="#E2E8F0"/>
+  <g fill="#22D3EE">
+    <path d="M512 503 L404 720 L442 720 L470 658 L554 658 L582 720 L620 720 Z"/>
+    <path d="M484 621 L540 621 L512 548 Z" fill="#FFFFFF"/>
+  </g>
+</svg>

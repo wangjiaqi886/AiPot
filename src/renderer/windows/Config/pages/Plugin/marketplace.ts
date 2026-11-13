@@ -1,0 +1,321 @@
+import { logger } from '@/renderer/lib/logger'
+import type { PluginInfo, PluginMarketplaceEntry } from '@/shared/types/electron-api'
+import { describeMarketplaceSourceError, type MarketplaceSourceErrorKind } from './marketplaceError'
+import type { InstalledPlugin } from './installedPlugins'
+
+export const DEFAULT_MARKETPLACE_SOURCE =
+  'https://raw.githubusercontent.com/shirumesu/Neopot-releases/main/marketplace-plugins.json'
+const MARKETPLACE_SOURCES_CONFIG_KEY = 'plugin_marketplace_sources'
+const MARKETPLACE_SOURCE_CONCURRENCY = 4
+const PLUGIN_UPDATE_SOURCE_CONCURRENCY = 4
+
+export interface MarketplacePlugin extends PluginMarketplaceEntry {
+  source: string
+}
+
+export interface MarketplaceSourceStatus {
+  source: string
+  isDefault: boolean
+  ok: boolean
+  count: number
+  errorKind?: MarketplaceSourceErrorKind
+  errorStatus?: number
+  error?: string
+}
+
+export interface MarketplaceLoadResult {
+  plugins: MarketplacePlugin[]
+  sources: MarketplaceSourceStatus[]
+}
+
+export interface PluginUpdate extends MarketplacePlugin {
+  installedVersion: string
+}
+
+async function mapWithConcurrency<T, R>(
+  values: T[],
+  concurrency: number,
+  mapper: (value: T, index: number) => Promise<R>,
+): Promise<R[]> {
+  if (values.length === 0) {
+    return []
+  }
+
+  const results = new Array<R>(values.length)
+  let nextIndex = 0
+  const workerCount = Math.min(concurrency, values.length)
+  await Promise.all(
+    Array.from({ length: workerCount }, async () => {
+      while (nextIndex < values.length) {
+        const index = nextIndex
+        nextIndex += 1
+        results[index] = await mapper(values[index], index)
+      }
+    }),
+  )
+  return results
+}
+
+function normalizeSourceList(value: unknown): string[] {
+  if (!Array.isArray(value)) {
+    return []
+  }
+
+  const sources = value
+    .filter((source): source is string => typeof source === 'string')
+    .map((source) => source.trim())
+    .filter((source) => source.length > 0 && source !== DEFAULT_MARKETPLACE_SOURCE)
+
+  return sources.filter((source, index) => sources.indexOf(source) === index)
+}
+
+export async function loadCustomMarketplaceSources(): Promise<string[]> {
+  return normalizeSourceList(await window.aiPot.config.get(MARKETPLACE_SOURCES_CONFIG_KEY))
+}
+
+export async function saveCustomMarketplaceSources(sources: string[]): Promise<string[]> {
+  const normalized = normalizeSourceList(sources)
+  await window.aiPot.config.set(MARKETPLACE_SOURCES_CONFIG_KEY, normalized)
+  return normalized
+}
+
+function marketplaceSourceValues(customSources: string[]): string[] {
+  return [DEFAULT_MARKETPLACE_SOURCE, ...normalizeSourceList(customSources)]
+}
+
+export function compareVersion(left: string, right: string) {
+  const leftParts = String(left ?? '')
+    .split('.')
+    .map((part) => Number.parseInt(part, 10) || 0)
+  const rightParts = String(right ?? '')
+    .split('.')
+    .map((part) => Number.parseInt(part, 10) || 0)
+  const length = Math.max(leftParts.length, rightParts.length)
+
+  for (let index = 0; index < length; index += 1) {
+    const diff = (leftParts[index] ?? 0) - (rightParts[index] ?? 0)
+    if (diff !== 0) {
+      return diff
+    }
+  }
+
+  return 0
+}
+
+function mergeMarketplacePlugin(
+  pluginsById: Map<string, MarketplacePlugin>,
+  plugin: PluginMarketplaceEntry,
+  source: string,
+): void {
+  const existing = pluginsById.get(plugin.id)
+  if (!existing || compareVersion(plugin.version, existing.version) > 0) {
+    pluginsById.set(plugin.id, {
+      ...plugin,
+      source,
+    })
+  }
+}
+
+export async function loadMarketplacePlugins(
+  customSources?: string[],
+): Promise<MarketplaceLoadResult> {
+  const sources = marketplaceSourceValues(customSources ?? (await loadCustomMarketplaceSources()))
+  const pluginsById = new Map<string, MarketplacePlugin>()
+  const sourceResults = await mapWithConcurrency(
+    sources,
+    MARKETPLACE_SOURCE_CONCURRENCY,
+    async (source, index) => {
+      try {
+        const plugins = await window.aiPot.plugins.inspectMarketplace(source)
+        return {
+          plugins,
+          status: {
+            source,
+            isDefault: index === 0,
+            ok: true,
+            count: plugins.length,
+          } satisfies MarketplaceSourceStatus,
+        }
+      } catch (error) {
+        const sourceError = describeMarketplaceSourceError(error)
+        logger.warn('Plugin marketplace source unavailable.', {
+          source,
+          reason: sourceError.message,
+        })
+        return {
+          plugins: [] as PluginMarketplaceEntry[],
+          status: {
+            source,
+            isDefault: index === 0,
+            ok: false,
+            count: 0,
+            errorKind: sourceError.kind,
+            errorStatus: sourceError.status,
+            error: sourceError.message,
+          } satisfies MarketplaceSourceStatus,
+        }
+      }
+    },
+  )
+
+  for (const { plugins, status } of sourceResults) {
+    if (status.ok) {
+      for (const plugin of plugins) {
+        mergeMarketplacePlugin(pluginsById, plugin, status.source)
+      }
+    }
+  }
+
+  return {
+    plugins: [...pluginsById.values()].sort((left, right) =>
+      left.display.localeCompare(right.display),
+    ),
+    sources: sourceResults.map(({ status }) => status),
+  }
+}
+
+export function findPluginUpdates(
+  installedPlugins: InstalledPlugin[],
+  marketplaceIndex: MarketplacePlugin[],
+) {
+  const installedById = new Map(installedPlugins.map((plugin) => [plugin.id, plugin]))
+
+  return marketplaceIndex
+    .filter((remote) => {
+      const installed = installedById.get(remote.id)
+      return installed && compareVersion(remote.version, installed.version) > 0
+    })
+    .map((remote) => ({
+      ...remote,
+      installedVersion: installedById.get(remote.id)?.version ?? '',
+    }))
+}
+
+export function marketplaceInstallSources(plugin: MarketplacePlugin): string[] {
+  return [plugin.download, plugin.dev]
+    .filter((source): source is string => typeof source === 'string' && source.trim().length > 0)
+    .filter((source, index, sources) => sources.indexOf(source) === index)
+}
+
+export async function installMarketplacePluginSource(plugin: MarketplacePlugin): Promise<string> {
+  const sources = marketplaceInstallSources(plugin)
+  let lastError: unknown = null
+
+  for (const source of sources) {
+    try {
+      await window.aiPot.plugins.installFromUrl(source)
+      return source
+    } catch (error) {
+      lastError = error
+      logger.warn('Marketplace plugin source install failed; trying next source if available.', {
+        id: plugin.id,
+        source,
+        reason: error instanceof Error ? error.message : String(error),
+      })
+    }
+  }
+
+  throw lastError ?? new Error('Marketplace plugin has no installable source.')
+}
+
+export async function checkPluginUpdates(installedPlugins: InstalledPlugin[]) {
+  const marketplaceResult = await loadMarketplacePlugins()
+  const marketplacePlugins = marketplaceResult.plugins
+  const marketplaceById = new Map(marketplacePlugins.map((plugin) => [plugin.id, plugin]))
+  const candidates = installedPlugins.map((installed) => {
+    const marketplacePlugin = marketplaceById.get(installed.id)
+    const sources: string[] = []
+    const addSource = (source: string | undefined) => {
+      if (source && !sources.includes(source)) {
+        sources.push(source)
+      }
+    }
+
+    addSource(installed.installSource)
+    for (const source of marketplacePlugin ? marketplaceInstallSources(marketplacePlugin) : []) {
+      addSource(source)
+    }
+
+    return { installed, marketplacePlugin, sources }
+  })
+
+  const sourceJobs = candidates.flatMap((candidate, candidateIndex) =>
+    candidate.sources.map((source) => ({ candidateIndex, source })),
+  )
+  const inspections = await mapWithConcurrency(
+    sourceJobs,
+    PLUGIN_UPDATE_SOURCE_CONCURRENCY,
+    async ({ candidateIndex, source }) => {
+      try {
+        const sourceManifest = await window.aiPot.plugins.inspectSource(source)
+        return { candidateIndex, source, sourceManifest }
+      } catch {
+        return { candidateIndex, source, sourceManifest: null }
+      }
+    },
+  )
+
+  const inspectionsByCandidate = new Map<number, Array<(typeof inspections)[number]>>()
+  for (const inspection of inspections) {
+    const candidateInspections = inspectionsByCandidate.get(inspection.candidateIndex) ?? []
+    candidateInspections.push(inspection)
+    inspectionsByCandidate.set(inspection.candidateIndex, candidateInspections)
+  }
+
+  const updates: PluginUpdate[] = []
+  for (const [candidateIndex, candidate] of candidates.entries()) {
+    const { installed, marketplacePlugin, sources } = candidate
+
+    if (sources.length === 0) {
+      continue
+    }
+
+    let highestVersion = installed.version
+    let highestManifest: PluginInfo | null = null
+    let highestSource = ''
+
+    for (const { source, sourceManifest } of inspectionsByCandidate.get(candidateIndex) ?? []) {
+      if (
+        !sourceManifest ||
+        sourceManifest.plugin_type !== installed.type ||
+        sourceManifest.name !== installed.name
+      ) {
+        continue
+      }
+
+      const sourceVersion = typeof sourceManifest.version === 'string' ? sourceManifest.version : ''
+      if (compareVersion(sourceVersion, highestVersion) > 0) {
+        highestVersion = sourceVersion
+        highestManifest = sourceManifest
+        highestSource = source
+      }
+    }
+
+    if (highestManifest && highestSource) {
+      updates.push({
+        id: installed.id,
+        type: installed.type,
+        name: installed.name,
+        display:
+          typeof highestManifest.display === 'string'
+            ? highestManifest.display
+            : marketplacePlugin?.display || installed.display,
+        version: highestVersion,
+        author:
+          typeof highestManifest.author === 'string'
+            ? highestManifest.author
+            : marketplacePlugin?.author || installed.author,
+        description:
+          typeof highestManifest.description === 'string'
+            ? highestManifest.description
+            : marketplacePlugin?.description || installed.description,
+        repo: marketplacePlugin?.repo || '',
+        download: highestSource,
+        dev: marketplacePlugin?.dev,
+        installedVersion: installed.version,
+        source: marketplacePlugin?.source || highestSource,
+      })
+    }
+  }
+  return updates
+}

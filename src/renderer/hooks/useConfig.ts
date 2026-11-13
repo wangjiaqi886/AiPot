@@ -1,0 +1,266 @@
+import { useCallback, useEffect, useMemo, useRef } from 'react'
+
+import { useGetState } from './useGetState'
+import { debounce } from '@/renderer/lib'
+import { logger } from '@/renderer/lib/logger'
+import {
+  STORE_CHANGED_EVENT,
+  STORE_RELOADED_EVENT,
+  deleteStoreValue,
+  getStoreValue,
+  setStoreValue,
+} from '@/renderer/lib/config/store'
+
+interface UseConfigOptions {
+  sync?: boolean
+}
+
+interface ConfigStoreUpdate {
+  hasValue: boolean
+  value?: unknown
+}
+
+type ConfigStoreSubscriber = (update: ConfigStoreUpdate) => void
+
+const configStoreSubscribers = new Map<string, Set<ConfigStoreSubscriber>>()
+let configStoreSubscriberCount = 0
+
+const onStoreValueChanged = (event: Event) => {
+  const detail = (event as CustomEvent<{ key?: unknown; value?: unknown }>).detail
+  if (!detail || typeof detail.key !== 'string') {
+    return
+  }
+
+  const subscribers = configStoreSubscribers.get(detail.key)
+  if (!subscribers) {
+    return
+  }
+
+  const update: ConfigStoreUpdate = Object.prototype.hasOwnProperty.call(detail, 'value')
+    ? { hasValue: true, value: detail.value }
+    : { hasValue: false }
+  subscribers.forEach((subscriber) => subscriber(update))
+}
+
+const onStoreReloaded = () => {
+  configStoreSubscribers.forEach((subscribers) => {
+    subscribers.forEach((subscriber) => subscriber({ hasValue: false }))
+  })
+}
+
+function subscribeToConfigStore(key: string, subscriber: ConfigStoreSubscriber): () => void {
+  let subscribers = configStoreSubscribers.get(key)
+  if (!subscribers) {
+    subscribers = new Set()
+    configStoreSubscribers.set(key, subscribers)
+  }
+  subscribers.add(subscriber)
+
+  if (configStoreSubscriberCount === 0) {
+    window.addEventListener(STORE_CHANGED_EVENT, onStoreValueChanged)
+    window.addEventListener(STORE_RELOADED_EVENT, onStoreReloaded)
+  }
+  configStoreSubscriberCount += 1
+
+  return () => {
+    const activeSubscribers = configStoreSubscribers.get(key)
+    activeSubscribers?.delete(subscriber)
+    if (activeSubscribers?.size === 0) {
+      configStoreSubscribers.delete(key)
+    }
+
+    configStoreSubscriberCount -= 1
+    if (configStoreSubscriberCount === 0) {
+      window.removeEventListener(STORE_CHANGED_EVENT, onStoreValueChanged)
+      window.removeEventListener(STORE_RELOADED_EVENT, onStoreReloaded)
+    }
+  }
+}
+
+export const isSameConfigValue = (left: unknown, right: unknown): boolean => {
+  if (Object.is(left, right)) {
+    return true
+  }
+
+  if (Array.isArray(left) && Array.isArray(right)) {
+    return (
+      left.length === right.length &&
+      left.every((value, index) => isSameConfigValue(value, right[index]))
+    )
+  }
+
+  if (
+    left &&
+    right &&
+    typeof left === 'object' &&
+    typeof right === 'object' &&
+    !Array.isArray(left) &&
+    !Array.isArray(right)
+  ) {
+    const leftEntries = Object.entries(left).filter(([, value]) => value !== undefined)
+    const rightRecord = right as Record<string, unknown>
+    const rightKeys = Object.entries(rightRecord)
+      .filter(([, value]) => value !== undefined)
+      .map(([key]) => key)
+
+    return (
+      leftEntries.length === rightKeys.length &&
+      leftEntries.every(
+        ([key, value]) =>
+          Object.prototype.hasOwnProperty.call(rightRecord, key) &&
+          isSameConfigValue(value, rightRecord[key]),
+      )
+    )
+  }
+
+  return false
+}
+
+const describeConfigValue = (value: unknown): Record<string, unknown> => {
+  if (typeof value === 'string') {
+    return {
+      valueType: 'string',
+      valueLength: value.length,
+    }
+  }
+
+  if (Array.isArray(value)) {
+    return {
+      valueType: 'array',
+      valueLength: value.length,
+    }
+  }
+
+  return {
+    valueType: value === null ? 'null' : typeof value,
+  }
+}
+
+export const useConfig = <T = unknown>(
+  key: string,
+  defaultValue: T,
+  options: UseConfigOptions = {},
+) => {
+  const [property, setPropertyState, getProperty] = useGetState(null) as [
+    T | null,
+    (value: T | null) => void,
+    () => T | null,
+  ]
+  const { sync = true } = options
+  const defaultValueRef = useRef(defaultValue)
+  const stateSyncRevisionRef = useRef(0)
+
+  useEffect(() => {
+    defaultValueRef.current = defaultValue
+  }, [defaultValue])
+
+  const persistStoreValue = useCallback(
+    async (v: T) => {
+      await setStoreValue(key, v)
+      logger.debug('Config value persisted.', {
+        key,
+        ...describeConfigValue(v),
+      })
+    },
+    [key],
+  )
+
+  const syncToStore = useMemo(
+    () =>
+      debounce((v: T) => {
+        void persistStoreValue(v).catch((error: unknown) => {
+          logger.error('Failed to save config value.', error, {
+            key,
+          })
+        })
+      }),
+    [key, persistStoreValue],
+  )
+
+  const setProperty = useCallback(
+    (v: T, forceSync = false) => {
+      const sameLocalValue = isSameConfigValue(getProperty(), v)
+      if (sameLocalValue && !forceSync) {
+        return Promise.resolve()
+      }
+
+      if (!sameLocalValue) {
+        setPropertyState(v)
+      }
+      const isSync = forceSync || sync
+      const logContext = {
+        key,
+        sync: isSync,
+        forceSync,
+        ...describeConfigValue(v),
+      }
+      if (isSync) {
+        logger.info(
+          sameLocalValue ? 'Config value force-synced.' : 'Config value changed.',
+          logContext,
+        )
+      } else {
+        logger.debug('Config value changed locally.', logContext)
+      }
+      if (!isSync) {
+        return Promise.resolve()
+      }
+
+      if (forceSync) {
+        return persistStoreValue(v)
+      }
+
+      syncToStore(v)
+      return Promise.resolve()
+    },
+    [getProperty, key, persistStoreValue, setPropertyState, sync, syncToStore],
+  )
+
+  const syncToState = useCallback(
+    (v: T | null) => {
+      const syncRevision = stateSyncRevisionRef.current + 1
+      stateSyncRevisionRef.current = syncRevision
+      if (v !== null) {
+        if (!isSameConfigValue(getProperty(), v)) {
+          setPropertyState(v)
+        }
+      } else {
+        void getStoreValue(key)
+          .then((loadedValue) => {
+            if (stateSyncRevisionRef.current !== syncRevision) {
+              return
+            }
+            const typedLoadedValue = loadedValue as T | null | undefined
+            if (typedLoadedValue === undefined || typedLoadedValue === null) {
+              setPropertyState(defaultValueRef.current)
+            } else {
+              setPropertyState(typedLoadedValue)
+            }
+          })
+          .catch((error: unknown) => {
+            if (stateSyncRevisionRef.current !== syncRevision) {
+              return
+            }
+            logger.error('Failed to read config value.', error, {
+              key,
+            })
+            setPropertyState(defaultValueRef.current)
+          })
+      }
+    },
+    [getProperty, key, setPropertyState],
+  )
+
+  useEffect(() => {
+    syncToState(null)
+    return subscribeToConfigStore(key, (update) => {
+      syncToState(update.hasValue ? (update.value as T) : null)
+    })
+  }, [key, syncToState])
+
+  return [property, setProperty, getProperty] as const
+}
+
+export const deleteKey = async (key: string) => {
+  await deleteStoreValue(key)
+}

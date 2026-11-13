@@ -1,0 +1,788 @@
+import {
+  Button,
+  Card,
+  CardBody,
+  CardFooter,
+  ButtonGroup,
+  Chip,
+  Tooltip,
+  Spacer,
+} from '@heroui/react'
+import React, { useCallback, useEffect, useRef, useState } from 'react'
+import { writeClipboardText } from '@/renderer/lib/electron/clipboard'
+import { HiOutlineVolumeUp } from 'react-icons/hi'
+import { getCurrentWindow } from '@/renderer/lib/electron/window'
+import { onAppEvent } from '@/renderer/lib/electron/events'
+import { MdContentCopy } from 'react-icons/md'
+import { MdSmartButton } from 'react-icons/md'
+import { useTranslation } from 'react-i18next'
+import { HiTranslate } from 'react-icons/hi'
+import { LuDelete } from 'react-icons/lu'
+import { atom, useAtom, useSetAtom } from 'jotai'
+import {
+  getServiceName,
+  getServiceSouceType,
+  isValidServiceInstanceKey,
+  ServiceSourceType,
+} from '@/renderer/lib/service/service_instance'
+import { useConfig, useSyncAtom, useTtsSpeak } from '../../../../hooks'
+import type { ServiceInstanceConfigMap } from '@/renderer/lib/service/serviceConfig'
+import { invoke_plugin } from '@/renderer/lib/plugin/invoke_plugin'
+import { invokeCommand } from '@/renderer/lib/electron/command'
+import type { RecognizeProvider } from '@/renderer/providers/recognize'
+import detect from '@/renderer/lib/language/lang_detect'
+import { reportRuntimeError } from '@/renderer/lib/runtimeError'
+import type { EnabledServicePluginList } from '@/renderer/windows/Config/pages/Plugin/installedPlugins'
+import {
+  toTranslateWorkflowPayload,
+  type SelectionCaptureFailureReason,
+  type SelectionCaptureResult,
+} from '@/shared/translateWorkflow'
+import {
+  alignedSentenceIndexAtom,
+  sentenceOffsets,
+  sentenceIndexAtClick,
+  splitIntoSentences,
+} from '../alignment'
+const appWindow = getCurrentWindow()
+
+export const sourceTextAtom = atom('')
+export const detectLanguageAtom = atom('')
+export const manualTranslateFlagAtom = atom('')
+export { alignedSentenceIndexAtom } from '../alignment'
+
+const DEFAULT_RECOGNIZE_SERVICE_LIST = ['local_model']
+interface SourceAreaProps {
+  pluginList: EnabledServicePluginList
+  serviceInstanceConfigMap: ServiceInstanceConfigMap
+}
+
+interface SourceNotice {
+  tone: 'warning' | 'danger'
+  message: string
+}
+
+const selectionCaptureFailureKeys: Record<SelectionCaptureFailureReason, string> = {
+  empty: 'translate.selection_capture.empty',
+  'copy-helper-unavailable': 'translate.selection_capture.copy_helper_unavailable',
+  'copy-command-failed': 'translate.selection_capture.copy_command_failed',
+  'copy-timeout': 'translate.selection_capture.copy_timeout',
+  'unsupported-platform': 'translate.selection_capture.unsupported_platform',
+}
+
+function toResultText(value: unknown): string {
+  return typeof value === 'string' ? value : String(value ?? '')
+}
+
+function toErrorMessage(error: unknown): string {
+  return error instanceof Error ? error.toString() : String(error)
+}
+
+function transformVarName(str: string) {
+  let str2 = str
+
+  // snake_case to SNAKE_CASE
+  if (/_[a-z]/.test(str2)) {
+    str2 = str2
+      .split('_')
+      .map((it: string) => it.toLocaleUpperCase())
+      .join('_')
+  }
+  if (str2 !== str) {
+    return str2
+  }
+
+  // SNAKE_CASE to kebab-case
+  if (/^[A-Z]+(_[A-Z]+)*$/.test(str2)) {
+    str2 = str2
+      .split('_')
+      .map((it: string) => it.toLocaleLowerCase())
+      .join('-')
+  }
+  if (str2 !== str) {
+    return str2
+  }
+
+  // kebab-case to dot.notation
+  if (/-/.test(str2)) {
+    str2 = str2
+      .split('-')
+      .map((it: string) => it.toLocaleLowerCase())
+      .join('.')
+  }
+  if (str2 !== str) {
+    return str2
+  }
+
+  // dot.notation to space separated
+  if (/\.[a-z]/.test(str2)) {
+    str2 = str2.replaceAll(/(\.)([a-z])/g, (_: string, _2: string, it: string) => ' ' + it)
+  }
+  if (str2 !== str) {
+    return str2
+  }
+
+  // space separated to Title Case
+  if (/\s[a-z]/.test(str2)) {
+    str2 = str2.replaceAll(/\s([a-z])/g, (_: string, it: string) => ' ' + it.toLocaleUpperCase())
+    str2 = str2.substring(0, 1).toLocaleUpperCase() + str2.substring(1)
+  }
+  if (str2 !== str) {
+    return str2
+  }
+
+  // Title Case to CamelCase
+  if (/\s[A-Z]/.test(str2)) {
+    str2 = str2.replaceAll(/\s([A-Z])/g, (_: string, it: string) => it)
+    str2 = str2.substring(0, 1).toLocaleLowerCase() + str2.substring(1)
+  }
+  if (str2 !== str) {
+    return str2
+  }
+
+  // CamelCase to PascalCase
+  if (/^[a-z]+[A-Z]+/.test(str2)) {
+    str2 = str2.substring(0, 1).toLocaleUpperCase() + str2.substring(1)
+  }
+  if (str2 !== str) {
+    return str2
+  }
+
+  // PascalCase to snake_case
+  if (/[^\s][A-Z]/.test(str2)) {
+    str2 = str2.replaceAll(/[A-Z]/g, (it: string, offset: number) => {
+      return (offset == 0 ? '' : '_') + it.toLocaleLowerCase()
+    })
+  }
+
+  return str2
+}
+
+export default function SourceArea(props: SourceAreaProps) {
+  const { pluginList, serviceInstanceConfigMap } = props
+  const [appFontSize] = useConfig('app_font_size', 16)
+  const [sourceText, setSourceText, syncSourceText] = useSyncAtom(sourceTextAtom)
+  const [detectLanguage, setDetectLanguage] = useAtom(detectLanguageAtom)
+  const setManualTranslateFlag = useSetAtom(manualTranslateFlagAtom)
+  const [incrementalTranslate] = useConfig('incremental_translate', false)
+  const [dynamicTranslate] = useConfig('dynamic_translate', false)
+  const [deleteNewline] = useConfig('translate_delete_newline', false)
+  const [recognizeLanguage] = useConfig<string>('recognize_language', 'auto')
+  const [recognizeServiceList] = useConfig<string[]>(
+    'recognize_service_list',
+    DEFAULT_RECOGNIZE_SERVICE_LIST,
+  )
+  const [hideWindow] = useConfig('translate_hide_window', false)
+  const [hideSource] = useConfig('hide_source', false)
+  const [sourceNotice, setSourceNotice] = useState<SourceNotice | null>(null)
+  const [windowType, setWindowType] = useState('[SELECTION_TRANSLATE]')
+  const [alignedSentenceIndex, setAlignedSentenceIndex] = useAtom(alignedSentenceIndexAtom)
+  const { t } = useTranslation()
+  const textAreaRef = useRef<HTMLTextAreaElement>(null)
+  const initialTextLoadedRef = useRef(false)
+  const workflowTextVersionRef = useRef(0)
+  const sourceTextChangeTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  const sentenceClickGuardRef = useRef<{ x: number; y: number } | null>(null)
+  // Holds an image workflow payload that arrived before the config store
+  // finished loading (recognizeServiceList / recognizeLanguage still null).
+  const pendingImageWorkflowRef = useRef<unknown>(null)
+  const { serviceInstanceKey: ttsServiceInstanceKey, speak: speakText } = useTtsSpeak({
+    pluginList,
+    serviceInstanceConfigMap,
+  })
+
+  const reportSourceAreaError = useCallback((error: unknown, source: string) => {
+    reportRuntimeError(error, {
+      source,
+      logMessage: 'Translate source operation failed.',
+      toastId: source,
+      context: {
+        window: 'translate',
+      },
+    })
+  }, [])
+
+  const detect_language = useCallback(
+    async (text: string) => {
+      setDetectLanguage(String(await detect(text)))
+    },
+    [setDetectLanguage],
+  )
+
+  const normalizeInputText = useCallback(
+    (text: string) => {
+      const trimmedText = text.trim()
+      if (deleteNewline) {
+        return trimmedText.replace(/-\s+/g, '').replace(/\s+/g, ' ')
+      }
+
+      return trimmedText
+    },
+    [deleteNewline],
+  )
+
+  const commitSourceText = useCallback(
+    async (newText: string) => {
+      const nextText = incrementalTranslate
+        ? [sourceText.trim(), newText].filter(Boolean).join('\n')
+        : newText
+
+      setSourceNotice(null)
+      // New text invalidates any sentence alignment from the previous text.
+      setAlignedSentenceIndex(null)
+      setSourceText(nextText)
+      await detect_language(nextText)
+      syncSourceText(nextText)
+    },
+    [
+      detect_language,
+      incrementalTranslate,
+      setAlignedSentenceIndex,
+      setSourceText,
+      sourceText,
+      syncSourceText,
+    ],
+  )
+
+  const showWorkflowWindow = useCallback(
+    (forceShow: boolean) => {
+      if (hideWindow && !forceShow) {
+        appWindow.hide()
+        return
+      }
+
+      appWindow.show()
+      appWindow.setFocus()
+    },
+    [hideWindow],
+  )
+
+  const showSelectionCaptureNotice = useCallback(
+    (capture: SelectionCaptureResult) => {
+      if (capture.ok) {
+        return
+      }
+
+      showWorkflowWindow(true)
+      setWindowType('[SELECTION_TRANSLATE]')
+      setDetectLanguage('')
+      setSourceNotice({
+        tone: capture.reason === 'empty' ? 'warning' : 'danger',
+        message: t(selectionCaptureFailureKeys[capture.reason]),
+      })
+      setSourceText('', true)
+      syncSourceText('')
+    },
+    [setDetectLanguage, setSourceText, showWorkflowWindow, syncSourceText, t],
+  )
+
+  const handleNewText = useCallback(
+    async (payload: unknown) => {
+      const workflow = toTranslateWorkflowPayload(payload)
+      setDetectLanguage('')
+      if (workflow.kind === 'selection') {
+        setWindowType('[SELECTION_TRANSLATE]')
+        if (!workflow.capture.ok) {
+          showSelectionCaptureNotice(workflow.capture)
+          return
+        }
+        showWorkflowWindow(false)
+        await commitSourceText(normalizeInputText(workflow.capture.text))
+      } else if (workflow.kind === 'text') {
+        const text = workflow.text.trim()
+        showWorkflowWindow(false)
+        if (text === '') {
+          setWindowType('[SELECTION_TRANSLATE]')
+          setSourceNotice(null)
+          setSourceText('', true)
+          syncSourceText('')
+          return
+        }
+        setWindowType('[SELECTION_TRANSLATE]')
+        await commitSourceText(normalizeInputText(text))
+      } else if (workflow.kind === 'input') {
+        showWorkflowWindow(true)
+        setWindowType('[INPUT_TRANSLATE]')
+        setSourceNotice(null)
+        setSourceText('', true)
+      } else if (workflow.kind === 'image') {
+        showWorkflowWindow(false)
+        setWindowType('[IMAGE_TRANSLATE]')
+        setSourceNotice(null)
+        if (recognizeServiceList === null || recognizeLanguage === null) {
+          // Config store has not loaded yet (window opened directly into an
+          // image workflow). Defer until `recognizeServiceList` /
+          // `recognizeLanguage` arrive instead of reporting "not configured".
+          pendingImageWorkflowRef.current = payload
+          return
+        }
+        if (recognizeServiceList.length === 0) {
+          setSourceText(t('errors.recognize_service_not_configured'))
+          return
+        }
+        const base64 = String(await invokeCommand('get_base64'))
+        // Load PaddleOCR/onnxruntime only when an image workflow actually
+        // needs it. A static import here pulled a ~11 MB OCR chunk into the
+        // translate window's initial bundle, slowing every shortcut wake-up.
+        const recognizeServiceMap =
+          (await import('@/renderer/providers/recognize')) as unknown as Record<
+            string,
+            RecognizeProvider
+          >
+        // Pick the first usable recognize service instead of blindly using
+        // list[0]: a plugin instance whose manifest is not loaded yet (or was
+        // removed) would otherwise produce "not configured" even though other
+        // services in the list are available.
+        const usableServiceInstanceKeys = recognizeServiceList.filter((candidateKey) => {
+          if (!isValidServiceInstanceKey(candidateKey)) {
+            return false
+          }
+          const candidateName = getServiceName(candidateKey)
+          if (getServiceSouceType(candidateKey) === ServiceSourceType.PLUGIN) {
+            return Boolean(pluginList['recognize'][candidateName]?.language)
+          }
+          return Boolean(recognizeServiceMap[candidateName])
+        })
+        if (usableServiceInstanceKeys.length === 0) {
+          setSourceText(t('errors.recognize_service_not_configured'))
+          return
+        }
+        const serviceInstanceKey = usableServiceInstanceKeys[0]
+        const serviceName = getServiceName(serviceInstanceKey)
+        if (getServiceSouceType(serviceInstanceKey) === ServiceSourceType.PLUGIN) {
+          const pluginInfo = pluginList['recognize'][serviceName]
+          if (!pluginInfo?.language) {
+            setSourceText(t('errors.recognize_service_not_configured'))
+            return
+          }
+          if (recognizeLanguage in pluginInfo.language) {
+            const pluginConfig = serviceInstanceConfigMap[serviceInstanceKey]
+
+            const [func, utils] = await invoke_plugin('recognize', serviceName)
+            func(base64, pluginInfo.language[recognizeLanguage], {
+              config: pluginConfig,
+              utils,
+            }).then(
+              (value) => {
+                void commitSourceText(normalizeInputText(toResultText(value)))
+              },
+              (e: unknown) => {
+                reportRuntimeError(e, {
+                  source: 'translate.image_recognize.plugin',
+                  logMessage: 'Image translation OCR plugin failed.',
+                  toastId: `translate.image_recognize.plugin:${serviceName}`,
+                  context: {
+                    service: serviceInstanceKey,
+                    language: recognizeLanguage,
+                  },
+                })
+                setSourceText(toErrorMessage(e))
+              },
+            )
+          } else {
+            setSourceText(t('errors.language_not_supported'))
+          }
+        } else {
+          const recognizeService = recognizeServiceMap[serviceName]
+          if (!recognizeService) {
+            setSourceText(t('errors.recognize_service_not_configured'))
+            return
+          }
+          if (recognizeLanguage in recognizeService.Language) {
+            recognizeService.recognize(base64, recognizeService.Language[recognizeLanguage]).then(
+              (value) => {
+                void commitSourceText(normalizeInputText(toResultText(value)))
+              },
+              (e: unknown) => {
+                reportRuntimeError(e, {
+                  source: 'translate.image_recognize.builtin',
+                  logMessage: 'Image translation OCR provider failed.',
+                  toastId: `translate.image_recognize.builtin:${serviceName}`,
+                  context: {
+                    service: serviceInstanceKey,
+                    language: recognizeLanguage,
+                  },
+                })
+                setSourceText(toErrorMessage(e))
+              },
+            )
+          } else {
+            setSourceText(t('errors.language_not_supported'))
+          }
+        }
+      }
+    },
+    [
+      commitSourceText,
+      normalizeInputText,
+      pluginList,
+      recognizeLanguage,
+      recognizeServiceList,
+      serviceInstanceConfigMap,
+      setDetectLanguage,
+      setSourceText,
+      showSelectionCaptureNotice,
+      showWorkflowWindow,
+      syncSourceText,
+      t,
+    ],
+  )
+
+  const keyDown = (event: React.KeyboardEvent) => {
+    if (event.key === 'Enter' && !event.shiftKey) {
+      event.preventDefault()
+      detect_language(sourceText).then(() => {
+        syncSourceText()
+      })
+    }
+  }
+
+  const handleNewTextRef = useRef(handleNewText)
+
+  useEffect(() => {
+    handleNewTextRef.current = handleNewText
+  }, [handleNewText])
+
+  // Replay an image workflow that was deferred while the config store was
+  // still loading. Runs once both values are non-null.
+  useEffect(() => {
+    if (
+      pendingImageWorkflowRef.current !== null &&
+      recognizeServiceList !== null &&
+      recognizeLanguage !== null
+    ) {
+      const pending = pendingImageWorkflowRef.current
+      pendingImageWorkflowRef.current = null
+      void handleNewTextRef.current(pending).catch((error) => {
+        reportSourceAreaError(error, 'translate.new_text.pending_image')
+      })
+    }
+  }, [recognizeServiceList, recognizeLanguage, reportSourceAreaError])
+
+  const handleSpeak = async () => {
+    if (!ttsServiceInstanceKey) {
+      throw new Error(t('translate.tts_not_configured'))
+    }
+    let detected = detectLanguage
+    if (detected === '') {
+      detected = String(await detect(sourceText))
+      setDetectLanguage(detected)
+    }
+    await speakText(sourceText, detected)
+  }
+
+  useEffect(() => {
+    const removeListener = onAppEvent('new_text', (payload) => {
+      appWindow.setFocus()
+      workflowTextVersionRef.current += 1
+      void handleNewTextRef.current(payload).catch((error) => {
+        reportSourceAreaError(error, 'translate.new_text')
+      })
+    })
+    void window.aiPot.app.rendererReady()
+
+    return removeListener
+  }, [reportSourceAreaError])
+
+  useEffect(() => {
+    return () => {
+      if (sourceTextChangeTimerRef.current) {
+        clearTimeout(sourceTextChangeTimerRef.current)
+        sourceTextChangeTimerRef.current = null
+      }
+    }
+  }, [])
+
+  useEffect(() => {
+    if (initialTextLoadedRef.current) {
+      return
+    }
+    if (
+      deleteNewline !== null &&
+      incrementalTranslate !== null &&
+      recognizeLanguage !== null &&
+      recognizeServiceList !== null &&
+      hideWindow !== null
+    ) {
+      initialTextLoadedRef.current = true
+      const requestVersion = workflowTextVersionRef.current
+      if (requestVersion !== 0) {
+        // A `new_text` event already delivered this window's text.
+        return
+      }
+      invokeCommand('get_text').then((v) => {
+        if (workflowTextVersionRef.current !== requestVersion) {
+          return
+        }
+        // `get_text` returns the raw workflow text, not a workflow payload.
+        // An empty result must not clear text delivered by a `new_text` event.
+        const text = typeof v === 'string' ? v : ''
+        if (text.trim() === '') {
+          return
+        }
+        void handleNewText({ kind: 'text', text }).catch((error) => {
+          reportSourceAreaError(error, 'translate.initial_text')
+        })
+      })
+    }
+  }, [
+    deleteNewline,
+    incrementalTranslate,
+    recognizeLanguage,
+    recognizeServiceList,
+    hideWindow,
+    handleNewText,
+    reportSourceAreaError,
+  ])
+
+  useEffect(() => {
+    if (!textAreaRef.current) {
+      return
+    }
+    textAreaRef.current.style.height = '50px'
+    textAreaRef.current.style.height = textAreaRef.current.scrollHeight + 'px'
+  }, [sourceText])
+
+  // Highlight the aligned sentence on the source side. Triggered by a click
+  // on either pane; both panes compute the same sentence index. The source is
+  // an editable textarea, so the highlight is a real selection and needs
+  // focus to render — hence the focus() call (the translation side renders a
+  // CSS highlight instead and never needs focus).
+  useEffect(() => {
+    const element = textAreaRef.current
+    if (!element) {
+      return
+    }
+    if (alignedSentenceIndex === null) {
+      if (element.selectionStart !== element.selectionEnd) {
+        element.setSelectionRange(element.selectionStart, element.selectionStart)
+      }
+      return
+    }
+    const sentences = splitIntoSentences(sourceText)
+    const offsets = sentenceOffsets(sourceText, sentences)
+    const index = alignedSentenceIndex
+    if (index < 0 || index >= sentences.length) {
+      return
+    }
+    const start = offsets[index]
+    const end = start + sentences[index].length
+    element.focus({ preventScroll: true })
+    element.setSelectionRange(start, end)
+  }, [alignedSentenceIndex, sourceText])
+
+  const changeSourceText = useCallback(
+    async (text: string) => {
+      setDetectLanguage('')
+      setSourceNotice(null)
+      await setSourceText(text)
+      if (dynamicTranslate) {
+        if (sourceTextChangeTimerRef.current) {
+          clearTimeout(sourceTextChangeTimerRef.current)
+        }
+        sourceTextChangeTimerRef.current = setTimeout(() => {
+          detect_language(text).then(() => {
+            syncSourceText()
+          })
+          sourceTextChangeTimerRef.current = null
+        }, 1000)
+      }
+    },
+    [detect_language, dynamicTranslate, setDetectLanguage, setSourceText, syncSourceText],
+  )
+
+  useEffect(() => {
+    const element = textAreaRef.current
+    if (!element) {
+      return
+    }
+
+    const onKeyDown = async (event: KeyboardEvent) => {
+      if (event.altKey && event.shiftKey && event.code === 'KeyU') {
+        const originText = element.value
+        const selectionStart = element.selectionStart
+        const selectionEnd = element.selectionEnd
+        const selectionText = originText.substring(selectionStart, selectionEnd)
+
+        const convertedText = transformVarName(selectionText)
+        const targetText =
+          originText.substring(0, selectionStart) +
+          convertedText +
+          originText.substring(selectionEnd)
+
+        await changeSourceText(targetText)
+        element.selectionStart = selectionStart
+        element.selectionEnd = selectionStart + convertedText.length
+      }
+    }
+
+    element.addEventListener('keydown', onKeyDown)
+    return () => element.removeEventListener('keydown', onKeyDown)
+  }, [changeSourceText])
+
+  return (
+    <div
+      className={
+        hideSource && windowType !== '[INPUT_TRANSLATE]' && !sourceNotice
+          ? 'hidden'
+          : 'flex min-h-0 flex-1 flex-col'
+      }
+    >
+      <Card
+        shadow="none"
+        className="flex min-h-0 flex-1 flex-col bg-content1 rounded-[10px] mt-px pb-0"
+      >
+        <CardBody className="flex min-h-0 flex-1 flex-col bg-content1 overflow-y-auto p-3 pb-0">
+          {sourceNotice && (
+            <div
+              className={`mb-2 rounded-small border px-3 py-2 text-sm ${
+                sourceNotice.tone === 'danger'
+                  ? 'border-danger/30 bg-danger/10 text-danger'
+                  : 'border-warning/30 bg-warning/10 text-warning-700'
+              }`}
+            >
+              {sourceNotice.message}
+            </div>
+          )}
+          <textarea
+            autoFocus
+            ref={textAreaRef}
+            className="w-full flex-auto resize-none bg-content1 outline-none"
+            style={{ fontSize: appFontSize ?? 16 }}
+            value={sourceText}
+            onKeyDown={keyDown}
+            onMouseDown={(e) => {
+              // Record the mousedown position to distinguish a plain click
+              // (alignment trigger) from a text-drag selection.
+              sentenceClickGuardRef.current = { x: e.clientX, y: e.clientY }
+            }}
+            onClick={(e) => {
+              // DeepL-style alignment: a plain click on a sentence selects the
+              // same-indexed sentence on both panes. Drag selections and clicks
+              // inside the already-aligned sentence clear the alignment so the
+              // editable source stays usable.
+              const guard = sentenceClickGuardRef.current
+              sentenceClickGuardRef.current = null
+              if (guard) {
+                const dx = Math.abs(e.clientX - guard.x)
+                const dy = Math.abs(e.clientY - guard.y)
+                if (dx > 4 || dy > 4) {
+                  return
+                }
+              }
+              const element = e.currentTarget
+              const sentences = splitIntoSentences(sourceText)
+              const clickedIndex = sentenceIndexAtClick(
+                sourceText,
+                sentences,
+                element.selectionStart ?? 0,
+              )
+              if (clickedIndex === null) {
+                return
+              }
+              setAlignedSentenceIndex((current) => (current === clickedIndex ? null : clickedIndex))
+            }}
+            onChange={(e) => {
+              const v = e.target.value
+              changeSourceText(v)
+            }}
+          />
+        </CardBody>
+
+        <CardFooter className="bg-content1 rounded-none rounded-b-[10px] flex justify-between px-3 p-1.25">
+          <div className="flex justify-start">
+            <ButtonGroup className="mr-1.25">
+              <Tooltip content={t('translate.speak')}>
+                <Button
+                  isIconOnly
+                  variant="light"
+                  size="sm"
+                  onPress={() => {
+                    handleSpeak().catch((e) => {
+                      reportRuntimeError(e, {
+                        source: 'translate.source.tts',
+                        logMessage: 'Source text TTS failed.',
+                        toastId: 'translate.source.tts',
+                        context: {
+                          service: ttsServiceInstanceKey ?? 'none',
+                          detectedLanguage: detectLanguage,
+                        },
+                      })
+                    })
+                  }}
+                >
+                  <HiOutlineVolumeUp className="text-[16px]" />
+                </Button>
+              </Tooltip>
+              <Tooltip content={t('translate.copy')}>
+                <Button
+                  isIconOnly
+                  variant="light"
+                  size="sm"
+                  onPress={() => {
+                    writeClipboardText(sourceText)
+                  }}
+                >
+                  <MdContentCopy className="text-[16px]" />
+                </Button>
+              </Tooltip>
+              <Tooltip content={t('translate.delete_newline')}>
+                <Button
+                  isIconOnly
+                  variant="light"
+                  size="sm"
+                  onPress={() => {
+                    const newText = sourceText.replace(/-\s+/g, '').replace(/\s+/g, ' ')
+                    setSourceText(newText)
+                    detect_language(newText).then(() => {
+                      syncSourceText()
+                    })
+                  }}
+                >
+                  <MdSmartButton className="text-[16px]" />
+                </Button>
+              </Tooltip>
+              <Tooltip content={t('common.clear')}>
+                <Button
+                  variant="light"
+                  size="sm"
+                  isIconOnly
+                  isDisabled={sourceText === ''}
+                  onPress={() => {
+                    setDetectLanguage('')
+                    setSourceNotice(null)
+                    setSourceText('', true)
+                  }}
+                >
+                  <LuDelete className="text-[16px]" />
+                </Button>
+              </Tooltip>
+            </ButtonGroup>
+            {detectLanguage !== '' && (
+              <Chip size="sm" color="secondary" variant="dot" className="my-auto">
+                {t(`languages.${detectLanguage}`)}
+              </Chip>
+            )}
+          </div>
+          <Tooltip content={t('translate.translate')}>
+            <Button
+              size="sm"
+              color="primary"
+              variant="light"
+              isIconOnly
+              className="text-[14px] font-bold"
+              startContent={<HiTranslate className="text-[16px]" />}
+              onPress={() => {
+                detect_language(sourceText).then(() => {
+                  syncSourceText()
+                  setManualTranslateFlag(crypto.randomUUID())
+                })
+              }}
+            />
+          </Tooltip>
+        </CardFooter>
+      </Card>
+      <Spacer y={2} />
+    </div>
+  )
+}

@@ -1,0 +1,150 @@
+@import 'tailwindcss';
+@config "../../tailwind.config.js";
+
+html,
+body,
+#root {
+  margin: 0;
+  min-height: 100%;
+}
+
+body {
+  overflow: hidden;
+}
+
+[data-window-drag-region='true'] {
+  -webkit-app-region: drag;
+}
+
+button,
+input,
+textarea,
+select,
+a,
+[role='button'] {
+  -webkit-app-region: no-drag;
+}
+
+html {
+  border-radius: 10px !important;
+  background: transparent !important;
+  overflow: hidden;
+}
+
+*::-webkit-scrollbar {
+  width: 5px;
+}
+
+*::-webkit-scrollbar-thumb {
+  background: color-mix(in srgb, var(--heroui-default-500, #71717a) 42%, transparent);
+  border-radius: 5px;
+}
+
+*::-webkit-scrollbar-thumb:hover {
+  background: color-mix(in srgb, var(--heroui-default-600, #52525b) 58%, transparent);
+}
+
+/* ============================================================
+   AiPot 1.4 motion & micro-interaction layer
+   All effects respect prefers-reduced-motion (see useMotion.ts;
+   the in-app switch sets the same media query on <html>).
+   ============================================================ */
+
+/* In-app "reduce motion" switch mirrors the OS media query: when the config
+   is on, <html data-reduce-motion="true"> is set from App.tsx and this rule
+   silences CSS transitions/animations the same way the media query does. */
+html[data-reduce-motion='true'] *,
+html[data-reduce-motion='true'] *::before,
+html[data-reduce-motion='true'] *::after {
+  animation-duration: 0.01ms !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0.01ms !important;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+  }
+}
+
+/* Buttons and icon-only controls press down (scale .96) with a quick
+   ease-out. HeroUI already applies a press ripple on its Button; this
+   covers the rest (custom act-btns, window controls, rail buttons). */
+.aipot-press {
+  transition: transform 0.13s cubic-bezier(0.34, 1.4, 0.5, 1);
+}
+.aipot-press:active {
+  transform: scale(0.94);
+}
+
+/* Hover lift for linked/interactive cards (2px, no tilt). */
+.aipot-lift {
+  transition:
+    transform 0.18s cubic-bezier(0.34, 1.2, 0.5, 1),
+    box-shadow 0.18s cubic-bezier(0.34, 1.2, 0.5, 1);
+}
+.aipot-lift:hover {
+  transform: translateY(-2px);
+}
+
+/* Skeleton shimmer for translation loading states. */
+.aipot-skeleton {
+  background: linear-gradient(
+    90deg,
+    color-mix(in srgb, var(--heroui-foreground, #e9edf3) 5%, transparent) 25%,
+    color-mix(in srgb, var(--heroui-foreground, #e9edf3) 11%, transparent) 50%,
+    color-mix(in srgb, var(--heroui-foreground, #e9edf3) 5%, transparent) 75%
+  );
+  background-size: 200% 100%;
+  animation: aipot-shimmer 1.6s ease-in-out infinite;
+  border-radius: 6px;
+}
+@keyframes aipot-shimmer {
+  0%,
+  100% {
+    background-position: 200% 0;
+  }
+  50% {
+    background-position: -200% 0;
+  }
+}
+
+/* Focus ring: uniform accent ring for keyboard navigation. */
+.aipot-focus-ring:focus-visible {
+  outline: 2px solid var(--heroui-primary, #5ab9fc);
+  outline-offset: 2px;
+  border-radius: 8px;
+}
+
+/* Toast entrance (bottom-center slide-up + fade). */
+@keyframes aipot-toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(8px) scale(0.98);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+  }
+}
+
+/* HeroUI modal: replace the default long fade/scale with the app's snappy
+   spring-like pop (scale .96→1 + fade, ~220 ms). */
+html[data-reduce-motion='true'] .heroui-Modal-wrapper,
+html[data-reduce-motion='true'] .heroui-Modal-backdrop {
+  transition-duration: 0.01ms !important;
+  animation-duration: 0.01ms !important;
+}
+.heroui-Modal-wrapper {
+  transition:
+    opacity 0.22s cubic-bezier(0.34, 1.2, 0.5, 1),
+    transform 0.22s cubic-bezier(0.34, 1.2, 0.5, 1) !important;
+}
+.heroui-Modal-wrapper[data-enter] {
+  --tw-enter-opacity: 0;
+  --tw-enter-scale: 0.96;
+}
